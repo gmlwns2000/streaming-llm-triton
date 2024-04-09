@@ -127,7 +127,7 @@ def _attention_scores_compute(
         Q, stride_q_n, stride_q_tdst, stride_q_hid,
         COS, stride_cos_t, stride_cos_hid,
         SIN, stride_sin_t, stride_sin_hid,
-        idx_n, idx_tdst, tl.minimum(tdst, WINDOW_SIZE + NUM_SINK),
+        idx_n, idx_tdst, tl.minimum(tdst, WINDOW_SIZE + NUM_SINK - 1),
         HID, BLOCK_HID,
     )
     
