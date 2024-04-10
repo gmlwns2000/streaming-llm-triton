@@ -1,6 +1,6 @@
 """
 Streaming-LLM: Triton Implementation
-gmlwns2000 @ github
+gmlwns2000, jeffwillette @ github
 """
 
 import torch
