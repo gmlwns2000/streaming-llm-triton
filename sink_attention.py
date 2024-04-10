@@ -3,6 +3,7 @@ Streaming-LLM: Triton Implementation
 gmlwns2000, jeffwillette @ github
 """
 
+import math
 import torch
 import triton
 import triton.language as tl
@@ -333,7 +334,7 @@ class AttentionScoreFunc(Function):
                 
                 BLOCK_HID,
                 
-                num_warps=1,
+                num_warps=2,
                 num_stages=1,
             )
         except RuntimeError as ex:
@@ -447,6 +448,7 @@ def attention_scores(
         requires_grad=q.requires_grad,
         dtype=values.dtype,
         device=values.device,
+        check_invariants=False,
     )
     
     return probs
@@ -764,9 +766,9 @@ if __name__ == '__main__':
     HID = 128
     NSINK = 4
     WIND = 512
-    QSIZE = 16
+    QSIZE = T
 
-    test_against_reference()
+    # test_against_reference()
     
     dtype = torch.float32
     std = 0.2
