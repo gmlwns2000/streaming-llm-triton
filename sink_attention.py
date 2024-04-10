@@ -5,6 +5,7 @@ gmlwns2000 @ github
 
 import torch
 import triton
+import math
 import triton.language as tl
 from torch import Tensor
 from torch.autograd import Function
@@ -219,7 +220,7 @@ def _attention_score_backward_compute(
         Q, stride_q_n, stride_q_tdst, stride_q_hid,
         COS, stride_cos_t, stride_cos_hid,
         SIN, stride_sin_t, stride_sin_hid,
-        idx_n, idx_tdst, tl.minimum(tdst, WINDOW_SIZE + NUM_SINK),
+        idx_n, idx_tdst, tl.minimum(tdst, WINDOW_SIZE + NUM_SINK - 1),
         HID, BLOCK_HID,
     )
     
@@ -433,35 +434,6 @@ def attention_scores(
     
     return probs
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    if position_ids is None:
-        N = q.shape[0]
-        TDST = q.shape[1]
-        position_ids = torch.arange(0, TDST, device=q.device)[None, :].expand(N, TDST)
-    
-    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-    cos = cos  # [seq_len, dim]
-    sin = sin  # [seq_len, dim]
-    assert cos.ndim == 2
-    cos = cos[position_ids]  # [bs, seq_len, dim]
-    sin = sin[position_ids]  # [bs, seq_len, dim]
-    assert position_ids.ndim == 2
-    assert cos.ndim == 3
-    
-    q_embed = (q * cos) + (rotate_half(q) * sin) 
-    
-    if k is not None:
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-    else:
-        k_embed = None
-    return q_embed, k_embed    
-
 def sink_attention(
     q: Tensor,
     k: Tensor,
@@ -487,12 +459,122 @@ def sink_attention(
     
     return context
 
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb_one(x, cos, sin, position_ids=None, unsqueeze_dim=1):
+    x_embed = (x * cos) + (rotate_half(x) * sin)
+    return x_embed
+
+
+def sink_attention_reference(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    num_sink: int = 4,
+    window_size: int = 512,
+):
+    scale = 1 / math.sqrt(q.size(-1))
+    outs = []
+    for i in range(q.size(1)):
+        _q = q[:, i:i + 1]
+        _k = k[:, :i + 1]
+        _v = v[:, :i + 1]
+
+        if i + 1 > num_sink + window_size:
+            k_sinks = _k[:, :num_sink]
+            v_sinks = _v[:, :num_sink]
+
+            k_window = _k[:, -window_size:]
+            v_window = _v[:, -window_size:]
+
+            _k = torch.cat((k_sinks, k_window), dim=1)
+            _v = torch.cat((v_sinks, v_window), dim=1)
+
+        _cos, _sin = cos[:_v.size(1)].unsqueeze(0), sin[:_v.size(1)].unsqueeze(
+            0)
+
+        _q = apply_rotary_pos_emb_one(_q, _cos[:, -1:], _sin[:, -1:])
+        _k = apply_rotary_pos_emb_one(_k, _cos, _sin)
+
+        atten = torch.einsum("bqd,bkd->bqk", _q, _k) * scale
+        atten = atten.softmax(dim=-1)
+        out = torch.bmm(atten, _v)
+        outs += [out]
+
+    return torch.cat(outs, dim=1)
+
+
+def test_against_reference():
+    eps = 1.0
+    q = torch.nn.Parameter(torch.randn((N, T, HID), device=0) * eps)
+    k = torch.nn.Parameter(torch.randn((N, T, HID), device=0) * eps)
+    v = torch.nn.Parameter(torch.randn((N, T, HID), device=0) * eps)
+    cos = torch.randn((T, HID), device=q.device)
+    sin = torch.randn((T, HID), device=q.device)
+
+    x = sink_attention(q, k, v, cos, sin, num_sink=NSINK, window_size=WIND)
+    x.mean().backward()
+
+    kernel_q_grad = q.grad
+    kernel_k_grad = k.grad
+    kernel_v_grad = v.grad
+
+    q.grad = None
+    k.grad = None
+    v.grad = None
+
+    x_reference = sink_attention_reference(q,
+                                 k,
+                                 v,
+                                 cos,
+                                 sin,
+                                 num_sink=NSINK,
+                                 window_size=WIND)
+
+    diff = (x - x_reference).abs().amax()
+    print(f"max difference between reference forward: {diff}")
+
+    x_reference.mean().backward()
+
+    for name, kern, reference in zip(("q", "k", "v"),
+                                (kernel_q_grad, kernel_k_grad, kernel_v_grad),
+                                (q, k, v)):
+        diff = (kern - reference.grad).abs().amax()
+        print(f"max difference between reference grad for {name}: {diff}")
+
+    # sanity check reference against pytorch. big sink and window makes it 
+    # full attention.
+    sanity_check = False
+    if sanity_check:
+        x_sdpa = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=1 / math.sqrt(q.size(-1)))
+        x_reference = sink_attention_reference(q,
+                                     k,
+                                     v,
+                                     cos,
+                                     sin,
+                                     num_sink=128,
+                                     window_size=128)
+
+        diff = (x_sdpa - x_reference).abs().amax()
+        print(f"{diff=}")
+
 if __name__ == '__main__':
     N = 1
     T = 8
     HID = 128
     NSINK = 2
     WIND = 4
+
+    test_against_reference()
     
     std = 0.5
     q = torch.nn.Parameter(torch.randn((N, T, HID), device=0) * std)
